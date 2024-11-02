@@ -1,6 +1,8 @@
 import SwiftUI
 import CoreMedia
 import ChunkedAudioPlayer
+import MediaPlayer
+import AVFAudio
 
 struct Shake: GeometryEffect {
     var amount: CGFloat = 10
@@ -19,6 +21,7 @@ struct TextToSpeechView: View {
     @AppStorage("apiKey") private var apiKey: String = ""
     @FocusState private var isFocused: Bool
     @StateObject private var player = AudioPlayer()
+    @StateObject private var streamManager = AudioStreamManager()
 
     @State private var format = SpeechFormat.mp3
     @State private var voice = SpeechVoice.alloy
@@ -44,6 +47,9 @@ struct TextToSpeechView: View {
             player.rate = rate
         }
     }
+
+    private let commandCenter = MPRemoteCommandCenter.shared()
+    private let audioSession = AVAudioSession.sharedInstance()
 
     var body: some View {
         VStack(alignment: .center, spacing: 24) {
@@ -94,15 +100,22 @@ struct TextToSpeechView: View {
         }
         .onChange(of: player.currentTime) { time in
             print("Time = \(time.seconds)")
+            updateNowPlayingInfo()
         }
         .onChange(of: player.currentDuration) { duration in
             print("Duration = \(duration.seconds)")
+            updateNowPlayingInfo()
         }
         .onChange(of: player.currentRate) { rate in
             print("Rate = \(rate)")
+            updateNowPlayingInfo()
         }
         .onChange(of: player.currentState) { state in
             print("State = \(state)")
+            updateNowPlayingInfo()
+        }
+        .onAppear {
+            setupRemoteControls()
         }
         #if os(iOS) || os(visionOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -224,7 +237,20 @@ struct TextToSpeechView: View {
             generateFeedback()
             inputKey = true
         } else {
-            player.start(api.textToSpeech(parameters: makeParameters()), type: format.fileType)
+            Task {
+                do {
+                    player.stop()
+                    streamManager.reset()
+                    let stream = streamManager.createStream(from: {
+                        try await api.textToSpeech(parameters: makeParameters())
+                    })
+                    player.start(stream, type: format.fileType)
+                    updateNowPlayingInfo()
+                } catch {
+                    errorMessage = String(describing: error)
+                    didFail = true
+                }
+            }
         }
     }
 
@@ -255,8 +281,114 @@ struct TextToSpeechView: View {
             didFail = false
         }
     }
+
+    private func setupRemoteControls() {
+        do {
+            try audioSession.setCategory(.playback, mode: .default)
+            try audioSession.setActive(true)
+        } catch {
+            print("Failed to set audio session category: \(error)")
+        }
+
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+        
+        commandCenter.playCommand.isEnabled = true
+        commandCenter.pauseCommand.isEnabled = true
+        commandCenter.stopCommand.isEnabled = true
+        commandCenter.skipForwardCommand.isEnabled = true
+        commandCenter.skipBackwardCommand.isEnabled = true
+        
+        commandCenter.playCommand.addTarget { [weak player] _ in
+            player?.resume()
+            return .success
+        }
+        
+        commandCenter.pauseCommand.addTarget { [weak player] _ in
+            player?.pause()
+            return .success
+        }
+        
+        commandCenter.stopCommand.addTarget { [weak player] _ in
+            player?.stop()
+            return .success
+        }
+        
+        commandCenter.skipBackwardCommand.preferredIntervals = [NSNumber(value: 5)]
+        commandCenter.skipForwardCommand.preferredIntervals = [NSNumber(value: 5)]
+        
+        commandCenter.skipBackwardCommand.addTarget { [weak player] _ in
+            player?.rewind(CMTime(seconds: 5.0, preferredTimescale: player?.currentTime.timescale ?? 1))
+            return .success
+        }
+        
+        commandCenter.skipForwardCommand.addTarget { [weak player] _ in
+            player?.forward(CMTime(seconds: 5.0, preferredTimescale: player?.currentTime.timescale ?? 1))
+            return .success
+        }
+
+        commandCenter.changePlaybackPositionCommand.isEnabled = true
+        
+        commandCenter.changePlaybackPositionCommand.addTarget { [weak player] event in
+            guard let player = player,
+                  let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            
+            let time = CMTime(seconds: event.positionTime, preferredTimescale: 1000)
+            player.seek(to: time)
+            return .success
+        }
+    }
+
+    private func updateNowPlayingInfo() {
+        var nowPlayingInfo = [String: Any]()
+        
+        nowPlayingInfo[MPMediaItemPropertyTitle] = text.isEmpty ? "Text to Speech" : text
+        nowPlayingInfo[MPMediaItemPropertyArtist] = "OpenAI \(voice.rawValue)"
+        nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = player.currentTime.seconds
+        nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = player.currentDuration.seconds
+        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = player.currentRate
+        nowPlayingInfo[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
+        nowPlayingInfo[MPNowPlayingInfoPropertyIsLiveStream] = false
+        
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+    }
 }
 
 #Preview {
     TextToSpeechView()
+}
+
+class AudioStreamManager: ObservableObject {
+    @Published private var cachedData: Data?
+    
+    func createStream(from dataProvider: @escaping () async throws -> AsyncThrowingStream<Data, Error>) -> AsyncThrowingStream<Data, Error> {
+        if let cachedData = cachedData {
+            return AsyncThrowingStream { continuation in
+                continuation.yield(cachedData)
+                continuation.finish()
+            }
+        } else {
+            return AsyncThrowingStream { continuation in
+                Task {
+                    do {
+                        var collectedData = Data()
+                        let stream = try await dataProvider()
+                        for try await chunk in stream {
+                            collectedData.append(chunk)
+                            continuation.yield(chunk)
+                        }
+                        await MainActor.run {
+                            self.cachedData = collectedData
+                        }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+            }
+        }
+    }
+    
+    func reset() {
+        cachedData = nil
+    }
 }

@@ -3,6 +3,7 @@ import CoreMedia
 import Combine
 import SwiftUI
 import ChunkedAudioPlayer
+import MediaPlayer
 
 struct LocalFileView: View {
     private let queue = DispatchQueue(label: "audio.player.read.queue")
@@ -29,6 +30,8 @@ struct LocalFileView: View {
             player.rate = rate
         }
     }
+
+    private let commandCenter = MPRemoteCommandCenter.shared()
 
     var body: some View {
         VStack(alignment: .center, spacing: 24) {
@@ -58,15 +61,22 @@ struct LocalFileView: View {
         }
         .onChange(of: player.currentTime) { time in
             print("Time = \(time.seconds)")
+            updateNowPlayingInfo()
         }
         .onChange(of: player.currentDuration) { duration in
             print("Duration = \(duration.seconds)")
+            updateNowPlayingInfo()
         }
         .onChange(of: player.currentRate) { rate in
             print("Rate = \(rate)")
+            updateNowPlayingInfo()
         }
         .onChange(of: player.currentState) { state in
             print("State = \(state)")
+            updateNowPlayingInfo()
+        }
+        .onAppear {
+            setupRemoteControls()
         }
         #if os(iOS) || os(visionOS)
         .navigationBarTitleDisplayMode(.inline)
@@ -123,6 +133,7 @@ struct LocalFileView: View {
 
     private func performConversion() {
         player.start(makeSampleStream(), type: kAudioFileMP3Type)
+        updateNowPlayingInfo()
     }
 
     private func makeSampleStream() -> AnyPublisher<Data, Error> {
@@ -158,6 +169,60 @@ struct LocalFileView: View {
             errorMessage = nil
             didFail = false
         }
+    }
+
+    private func setupRemoteControls() {
+        // Enable receiving remote control events
+        UIApplication.shared.beginReceivingRemoteControlEvents()
+        
+        // Configure command center
+        let commandCenter = MPRemoteCommandCenter.shared()
+        
+        // Enable all the commands we want to handle
+        commandCenter.playCommand.isEnabled = true
+        commandCenter.pauseCommand.isEnabled = true
+        commandCenter.stopCommand.isEnabled = true
+        commandCenter.skipForwardCommand.isEnabled = true
+        commandCenter.skipBackwardCommand.isEnabled = true
+        
+        commandCenter.playCommand.addTarget { [weak player] _ in
+            player?.resume()
+            return .success
+        }
+        
+        commandCenter.pauseCommand.addTarget { [weak player] _ in
+            player?.pause()
+            return .success
+        }
+        
+        commandCenter.stopCommand.addTarget { [weak player] _ in
+            player?.stop()
+            return .success
+        }
+        
+        commandCenter.skipBackwardCommand.addTarget { [weak player] _ in
+            player?.rewind(CMTime(seconds: 5.0, preferredTimescale: player?.currentTime.timescale ?? 1))
+            return .success
+        }
+        
+        commandCenter.skipForwardCommand.addTarget { [weak player] _ in
+            player?.forward(CMTime(seconds: 5.0, preferredTimescale: player?.currentTime.timescale ?? 1))
+            return .success
+        }
+    }
+    
+    private func updateNowPlayingInfo() {
+        var nowPlayingInfo = [String: Any]()
+        
+        // Add required metadata
+        nowPlayingInfo[MPMediaItemPropertyTitle] = (samplePath as NSString).lastPathComponent
+        nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = player.currentTime.seconds
+        nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = player.currentDuration.seconds
+        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = player.currentState == .playing ? 1.0 : 0.0
+        nowPlayingInfo[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
+        
+        // Update the now playing info
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
     }
 }
 
